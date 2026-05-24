@@ -44,14 +44,6 @@ M = None
 cx = 0
 cy = 0
 
-# Реальные размеры половины корта (напротив пушки)
-COURT_HALF_LENGTH = 23.77 / 2   # 11.885 м — от сетки до задней линии
-COURT_FULL_LENGTH = 23.77       # полная длина корта
-COURT_WIDTH       = 8.23        # ширина корта
-
-# Вычисляется при калибровке из 4 точек — не хардкод!
-Y_net_computed = COURT_HALF_LENGTH  # fallback до калибровки
-
 # MQTT Settings
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
@@ -220,7 +212,7 @@ def calculate_custom_drill():
         y = round(float(1.0 - i["y"]), 2)
         delay = i["delay"]
 
-        result = calculate_launcher_shot_normalized(x, y, Y_net=Y_net_computed)
+        result = calculate_launcher_shot_normalized(x, y)
         if result is None:
             print(f"Ball id={i['id']} skipped — unreachable at x={x}, y={y}")
             continue
@@ -281,61 +273,6 @@ def compute_warp_size(pts):
 
 
 
-def compute_y_net_from_calibration(src_pixels, frame_w, frame_h):
-    """
-    Вычисляет реальное расстояние от пушки до сетки в метрах.
-
-    src_pixels — 4 угловые точки рабочей половины корта в пикселях,
-    упорядоченные как: [top-left, top-right, bottom-right, bottom-left]
-    (результат order_points_safe).
-
-    Логика:
-      - Игрок отмечает углы РАБОЧЕЙ половины (напротив пушки).
-      - Ближний к камере край src → линия сетки.
-      - Дальний край src → задняя линия противника.
-      - Мировые координаты известны из размеров корта.
-      - Обратная гомография даёт мировые координаты пикселя пушки,
-        из чего мы находим расстояние до сетки.
-    """
-    tl, tr, br, bl = src_pixels  # порядок из order_points_safe
-
-    # Мировые координаты 4 углов рабочей половины.
-    # Система отсчёта: Y=0 — линия сетки, Y=COURT_HALF_LENGTH — задняя линия.
-    # X=0 — центр, X=±COURT_WIDTH/2 — боковые линии.
-    half_w = COURT_WIDTH / 2
-    world_pts = np.array([
-        [-half_w, 0                 ],   # tl — сетка, левый угол
-        [ half_w, 0                 ],   # tr — сетка, правый угол
-        [ half_w, COURT_HALF_LENGTH ],   # br — задняя линия, правый угол
-        [-half_w, COURT_HALF_LENGTH ],   # bl — задняя линия, левый угол
-    ], dtype=np.float32)
-
-    pixel_pts = np.array([tl, tr, br, bl], dtype=np.float32)
-
-    # Гомография: пиксель → мировые координаты (только рабочая половина)
-    H_inv, _ = cv2.findHomography(pixel_pts, world_pts)
-    if H_inv is None:
-        print("⚠️  compute_y_net: findHomography вернул None, используем fallback")
-        return COURT_HALF_LENGTH
-
-    # Пиксельные координаты пушки = центр нижнего края кадра
-    # (камера на пушке, смотрит вперёд)
-    launcher_px = np.array([[[frame_w / 2.0, frame_h]]], dtype=np.float32)
-    launcher_world = cv2.perspectiveTransform(launcher_px, H_inv)[0][0]
-
-    # launcher_world[1] — Y пушки в системе "от сетки".
-    # Отрицательное значение = пушка стоит ЗА своей стороной (нормально).
-    y_launcher_world = float(launcher_world[1])
-
-    # Расстояние от пушки до сетки:
-    # сетка находится при Y=0, пушка при Y=y_launcher_world (<0)
-    y_net = abs(y_launcher_world)
-
-    print(f"📐 Пушка в мировых координатах: Y = {y_launcher_world:.3f} м от сетки")
-    print(f"📐 Вычисленное расстояние до сетки: Y_net = {y_net:.3f} м")
-    return y_net
-
-
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("Connected to MQTT broker")
@@ -346,7 +283,7 @@ def on_connect(client, userdata, flags, rc):
 
 def on_message(client, userdata, msg):
     global balls, need_frame, calibrated_points, M, calibrated
-    global WARP_W, WARP_H, Y_net_computed
+    global WARP_W, WARP_H
 
     payload = msg.payload.decode()
     print(f"MQTT received raw: {payload}")
@@ -428,14 +365,6 @@ def on_message(client, userdata, msg):
         ], dtype=np.float32)
             M = cv2.getPerspectiveTransform(src, dst)
             calibrated = True
-
-            # Вычисляем реальное расстояние до сетки из калибровочных точек
-            if last_frame is not None:
-                frame_h, frame_w = last_frame.shape[:2]
-                Y_net_computed = compute_y_net_from_calibration(src, frame_w, frame_h)
-            else:
-                Y_net_computed = COURT_HALF_LENGTH
-                print(f"⚠️  last_frame недоступен, Y_net = fallback {Y_net_computed:.3f} м")
             
             
 
@@ -680,11 +609,7 @@ while True:
             if x_norm is not None and y_norm is not None:
                 
             
-                theta, phi, rpm = calculate_launcher_shot_normalized(
-                    round(float(x_norm), 2),
-                    round(float(y_norm), 2),
-                    Y_net=Y_net_computed        # ← вычислено из калибровки
-                )
+                theta, phi, rpm = calculate_launcher_shot_normalized(round(float(x_norm),2), round(float(y_norm), 2))
                 print(f"Elevation θ: {math.degrees(theta):.2f}°")
                 print(f"Horizontal φ: {math.degrees(phi):.2f}°")
                 print(f"Wheel RPM: {rpm:.0f}")
@@ -724,3 +649,4 @@ cap.release()
 cv2.destroyAllWindows()
 mqtt_client.loop_stop()
 mqtt_client.disconnect()
+
